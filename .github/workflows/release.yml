@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      - name: Show env
+        run: |
+          go version
+          uname -a
+
+      - name: Build
+        env:
+          GOOS:        linux
+          GOARCH:      amd64
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist
+          out="dist/alpine-rc-rest-linux-amd64"
+          go build -trimpath -ldflags "-s -w" -o "${out}" .
+          chmod +x "${out}"
+          sha256sum "${out}" | awk '{print $1}' > "${out}.sha256"
+          ls -la dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: alpine-rc-rest-linux-amd64
+          path: |
+            dist/alpine-rc-rest-linux-amd64
+            dist/alpine-rc-rest-linux-amd64.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: |
+          find artifacts -type f -print
+
+      - name: Create release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/alpine-rc-rest-*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') }}
