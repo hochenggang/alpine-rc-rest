@@ -2,34 +2,48 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
-// runCommand 同步执行命令并返回合并输出
+// runCommand 同步执行命令并返回合并输出。
+// 带 15s 超时，避免 rc-* 子进程卡死时把 handler goroutine 耗光。
 func runCommand(name string, args ...string) (string, error) {
-	cmd := exec.Command(name, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
 	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return string(out), fmt.Errorf("%s %v: timeout after 15s", name, args)
+	}
 	return string(out), err
 }
 
 // ---------- OpenRC 封装 ----------
 
-// getServiceStatus 查询服务状态：started / stopped / unknown
+// getServiceStatus 查询服务状态：started / stopped / crashed / unknown
 func getServiceStatus(name string) string {
 	out, err := runCommand("rc-service", name, "status")
-	if err != nil {
-		// rc-service 在 stopped 时返回非零
-		if strings.Contains(out, "stopped") {
-			return "stopped"
-		}
+	if err == nil {
+		return "started"
+	}
+	low := strings.ToLower(out)
+	switch {
+	case strings.Contains(low, "stopped"), strings.Contains(low, "inactive"):
+		return "stopped"
+	case strings.Contains(low, "crashed"):
+		return "crashed"
+	default:
+		log.Printf("getServiceStatus %s: %v: %q", name, err, strings.TrimSpace(out))
 		return "unknown"
 	}
-	return "started"
 }
 
 // isEnabledInDefault 查询是否在 default 运行级别启用
@@ -118,7 +132,9 @@ func removeDir(p string) error {
 
 // ---------- 用户与权限 ----------
 
-// ensureProjectUser 幂等创建同名 nologin 系统用户与组
+// ensureProjectUser 幂等创建同名 nologin 系统用户与组。
+//   注：adduser 失败时不会主动回滚 group —— group 是幂等创建的，
+//   即使 adduser 失败，残留的同名 group 也无害；下此 POST 仍能复用。
 func ensureProjectUser(name string) error {
 	if _, err := runCommand("getent", "group", name); err != nil {
 		if out, err := runCommand("addgroup", "-S", name); err != nil {
@@ -147,8 +163,9 @@ func chownProjectDir(path, user, group string) error {
 
 // ---------- env 文件 ----------
 
-// writeEnvFile 把 env map 写入 /opt/<name>/env
-// 跳过空 key、校验 K=V 格式
+// writeEnvFile 把 env map 写入 /opt/<name>/env。
+// value 用 shell 单引号包裹并把内部的 ' 转义为 '\''，
+// 这样 . path + set -a 加载时 sh 不会展开 $ / ` 等字符。
 func writeEnvFile(path string, env map[string]string) error {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
 	if err != nil {
@@ -160,7 +177,8 @@ func writeEnvFile(path string, env map[string]string) error {
 		if !validEnvKey(k) {
 			return fmt.Errorf("invalid env key: %q", k)
 		}
-		if _, err := fmt.Fprintf(w, "%s=%s\n", k, v); err != nil {
+		safe := "'" + strings.ReplaceAll(v, "'", `'\''`) + "'"
+		if _, err := fmt.Fprintf(w, "%s=%s\n", k, safe); err != nil {
 			return err
 		}
 	}

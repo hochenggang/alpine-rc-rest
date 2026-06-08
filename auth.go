@@ -8,13 +8,15 @@ import (
 )
 
 // apiToken 启动时从环境变量 SERVICE_MANAGER_TOKEN 读取。
-// 为空表示不强制鉴权（仅 dev 模式），此时会打印警告。
+// 为空表示不强制鉴权（仅 dev 模式），main 启动时会额外打一条醒目 warn。
 var apiToken string
 
-func init() {
+// LoadToken 从环境变量读取 API token。仅 main 在启动期调一次，
+// 不放在 init() 中以保持可测试性。
+func LoadToken() {
 	apiToken = os.Getenv("SERVICE_MANAGER_TOKEN")
 	if apiToken == "" {
-		log.Println("[WARN] SERVICE_MANAGER_TOKEN not set, authentication is DISABLED")
+		log.Println("[WARN] SERVICE_MANAGER_TOKEN not set — authentication is DISABLED")
 	}
 }
 

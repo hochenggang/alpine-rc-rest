@@ -12,6 +12,14 @@ import (
 )
 
 func main() {
+	LoadToken()
+	if apiToken == "" {
+		log.Println("================================================================")
+		log.Println(" [WARN] AUTHENTICATION DISABLED — DO NOT EXPOSE TO PUBLIC NETWORK")
+		log.Println(" [WARN] set SERVICE_MANAGER_TOKEN env var and restart to enable")
+		log.Println("================================================================")
+	}
+
 	mux := http.NewServeMux()
 	// 项目管理
 	mux.HandleFunc("GET /api/v1/project", listProjects)
@@ -34,6 +42,9 @@ func main() {
 		Addr:              addr,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -48,7 +59,7 @@ func main() {
 
 	<-ctx.Done()
 	log.Println("shutting down...")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown error: %v", err)

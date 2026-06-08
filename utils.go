@@ -15,7 +15,11 @@ type Response struct {
 }
 
 // 名称校验
-var validNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+//   字符集：a-z A-Z 0-9 _ -
+//   长度：1-32（与 Linux 系统用户名 / adduser 限制对齐）
+const MaxNameLen = 32
+
+var validNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,32}$`)
 
 func isValidServiceName(name string) bool {
 	return validNameRegex.MatchString(name)

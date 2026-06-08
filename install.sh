@@ -26,7 +26,7 @@ NONINTERACTIVE="${YES:-0}"
 
 # ---------- UI ----------
 
-log()  { printf '\033[1;34m[install]\033[0m %s\n' "$*"; }
+log()  { printf '\033[1;34m[install]\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[1;33m[warn]\033[0m    %s\n' "$*" >&2; }
 err()  { printf '\033[1;31m[error]\033[0m  %s\n' "$*" >&2; }
 
@@ -54,19 +54,19 @@ confirm() {
   esac
 }
 
-# ask_url <prompt> <default>  询问 URL；回车 = 默认
+# ask_url <default>  询问 URL；回车 = 默认
+#   提示/默认信息写到 stderr，避免被命令替换 $(ask_url ...) 误捕获
 ask_url() {
-  prompt="$1"
-  default="$2"
-  printf "%s\n" "$prompt"
-  printf "  default: %s\n" "$default"
-  printf "  custom : "
+  default="$1"
+  printf "直接回车后将拉取 [%s]\n" "$default" >&2
+  printf "如需自定义二进制文件链接，请输入后再回车。\n" >&2
+  printf "[等待用户输入:] " >&2
   if [ "$NONINTERACTIVE" = "1" ]; then
-    printf "%s (non-interactive)\n" "$default"
+    printf "%s (non-interactive)\n" "$default" >&2
     printf "%s" "$default"
     return
   fi
-  read -r ans || true
+  IFS= read -r ans < /dev/tty || ans=""
   if [ -z "$ans" ]; then
     printf "%s" "$default"
   else
@@ -189,12 +189,12 @@ write_openrc_script() {
   cat > "$initd" <<'EOF'
 #!/sbin/openrc-run
 
-name="alpine-rc-rest"
-description="REST API for managing OpenRC services on Alpine Linux"
-command="/usr/local/bin/alpine-rc-rest"
-command_user="root"
+name='alpine-rc-rest'
+description='REST API for managing OpenRC services on Alpine Linux'
+command='/usr/local/bin/alpine-rc-rest'
+command_user='root'
 command_background=true
-pidfile="/run/alpine-rc-rest.pid"
+pidfile='/run/alpine-rc-rest.pid'
 
 depend() {
     need net
@@ -213,6 +213,28 @@ EOF
   log "已写入 $initd"
 }
 
+# prepare_reinstall 检测已安装并：
+#   1. stop 旧服务（容忍失败）
+#   2. 从所有运行级别移除（容忍失败）
+#   3. 从 /etc/conf.d 中读旧 token 沿用（避免重装后鉴权失效）
+prepare_reinstall() {
+  initd="/etc/init.d/${SERVICE_NAME}"
+  conf="/etc/conf.d/${SERVICE_NAME}"
+  if [ -f "$initd" ]; then
+    log "检测到已安装：停止旧服务（容忍失败）"
+    rc-service ${SERVICE_NAME} stop 2>/dev/null || true
+    rc-update del ${SERVICE_NAME} 2>/dev/null || true
+  fi
+  # 沿用旧 token（仅当未通过环境变量显式提供时）
+  if [ -z "${TOKEN:-}" ] && [ -f "$conf" ]; then
+    cur=$(sed -n 's/^SERVICE_MANAGER_TOKEN=["]\{0,1\}\([^"]*\)["]\{0,1\}$/\1/p' "$conf" | head -n1)
+    if [ "${#cur}" -eq 32 ]; then
+      TOKEN="$cur"
+      log "沿用旧 token（来自 $conf）"
+    fi
+  fi
+}
+
 post_install_tips() {
   token="$1"
   port="${LISTEN_ADDR##*:}"
@@ -221,8 +243,10 @@ post_install_tips() {
 [✓] 安装完成。
 
 ================================================================
-  API Token（请妥善保存，仅打印这一次）：
-    ${token}
+  API Token
+    持久化位置：/etc/conf.d/${SERVICE_NAME}
+    当前值    ：${token}
+    重新获取  ：sudo grep SERVICE_MANAGER_TOKEN /etc/conf.d/${SERVICE_NAME}
 ================================================================
 
 下一步：
@@ -230,11 +254,11 @@ post_install_tips() {
        sudo rc-service ${SERVICE_NAME} start
        sudo rc-update add ${SERVICE_NAME} default
   2. 验证：
-       curl -s -H "X-API-Token: ${token}" \\
+       curl -s -H "X-API-Token: \${token}" \\
             http://127.0.0.1:${port}/api/v1/project
   3. 部署一个项目（示例）：
        curl -X POST http://127.0.0.1:${port}/api/v1/project \\
-            -H "X-API-Token: ${token}" \\
+            -H "X-API-Token: \${token}" \\
             -H "Content-Type: application/json" \\
             -d '{
               "project_name": "myapi",
@@ -265,6 +289,9 @@ BANNER
     exit 0
   fi
 
+  # 1.5. 检测重装：stop 旧服务、沿用旧 token
+  prepare_reinstall
+
   # 2. 确定版本
   if [ -z "$VERSION" ]; then
     log "查询最新 release ..."
@@ -280,7 +307,7 @@ BANNER
 
   # 3. 计算默认 URL + URL 提示
   default_url="https://github.com/${REPO}/releases/download/${VERSION}/alpine-rc-rest-${goos}-${goarch}"
-  url=$(ask_url "拉取 alpine-rc-rest 二进制可执行文件的 URL？回车使用默认 GitHub 链接，或粘贴自定义 URL：" "$default_url")
+  url=$(ask_url "$default_url")
   if [ -z "$url" ]; then url="$default_url"; fi
   if ! validate_url "$url"; then
     err "非法 URL（仅支持 http/https）：$url"

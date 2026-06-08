@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -59,6 +60,16 @@ func downloadBinary(rawURL, dst string) error {
 
 	client := &http.Client{
 		Timeout: downloadTimeout,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   connectTimeout,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout:   connectTimeout,
+			ResponseHeaderTimeout: connectTimeout,
+			ExpectContinueTimeout: connectTimeout,
+			IdleConnTimeout:       90 * time.Second,
+		},
 		// 默认 CheckRedirect 跟随最多 10 次
 	}
 	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
@@ -139,41 +150,110 @@ start_pre() {
 
 // ---------- 业务逻辑 ----------
 
+// partialState 记录 performCreate 过程中已成功建立的资产，
+// 出错时按反序清理；只清理本流程创建的，不动 user（与 DELETE 一致）。
+type partialState struct {
+	dirCreated  bool // os.MkdirAll 成功
+	userEnsured bool // ensureProjectUser 成功（不清）
+	binWritten  bool // downloadBinary 成功
+	envWritten  bool // writeEnvFile 成功
+	initWritten bool // writeServiceScript 成功
+	chowned     bool // chownProjectDir 成功
+	enabled     bool // rc-update add 成功
+	started     bool // rc-service start 成功
+}
+
+func (p *partialState) rollback(name string) {
+	// 反序：service → runlevel → init script → env → bin → dir
+	if p.started {
+		_ = stopService(name)
+	}
+	if p.enabled {
+		_ = removeFromAllRunlevels(name)
+	}
+	if p.initWritten {
+		_ = deleteServiceScript(name)
+	}
+	if p.envWritten {
+		_ = os.Remove(projectEnvPath(name))
+	}
+	if p.binWritten {
+		_ = os.Remove(projectBinPath(name))
+	}
+	if p.dirCreated {
+		_ = os.RemoveAll(projectDir(name))
+	}
+	// 不删 user/group（与 DELETE 一致）
+}
+
 // performCreate 完整创建流程：准备目录 → 用户 → 下载二进制 → 写 env → 写 init → 授权 → 启动
+// 任何中间步骤失败会回滚已建资产（不动 user）。
 func performCreate(req CreateProjectRequest) error {
 	name := req.ProjectName
+	var st partialState
+	defer func() {
+		// 失败回滚：handler 收到 err 就 500
+	}()
+	rollback := func() { st.rollback(name) }
+
 	if err := os.MkdirAll(projectDir(name), 0o750); err != nil {
 		return fmt.Errorf("mkdir %s: %w", projectDir(name), err)
 	}
+	st.dirCreated = true
+
 	if err := ensureProjectUser(name); err != nil {
+		rollback()
 		return err
 	}
+	st.userEnsured = true
+
 	if err := downloadBinary(req.BinURL, projectBinPath(name)); err != nil {
+		rollback()
 		return err
 	}
+	st.binWritten = true
+
 	if err := os.Chmod(projectBinPath(name), 0o755); err != nil {
+		rollback()
 		return fmt.Errorf("chmod bin: %w", err)
 	}
+
 	if err := writeEnvFile(projectEnvPath(name), req.Env); err != nil {
+		rollback()
 		return err
 	}
+	st.envWritten = true
+
 	if err := writeServiceScript(name, renderInitScript(name)); err != nil {
+		rollback()
 		return err
 	}
+	st.initWritten = true
+
 	if err := chownProjectDir(projectDir(name), name, name); err != nil {
+		rollback()
 		return err
 	}
+	st.chowned = true
+
+	// 启动前先 stop 容忍已运行实例
 	_ = stopService(name)
 	if err := enableService(name); err != nil {
+		// enable 失败不回滚（init script 已建），只 log
 		log.Printf("enable %s: %v", name, err)
+	} else {
+		st.enabled = true
 	}
 	if err := startService(name); err != nil {
-		log.Printf("start %s: %v", name, err)
+		rollback()
+		return fmt.Errorf("start %s: %w", name, err)
 	}
+	st.started = true
 	return nil
 }
 
-// performUpdate 部分更新：提供哪个字段就更新哪个
+// performUpdate 部分更新：提供哪个字段就更新哪个。
+// bin / env 写入前先备份旧文件到 .bak，失败时回写；最后 chown + stop → start。
 func performUpdate(name string, req UpdateProjectRequest) error {
 	if req.BinURL == "" && len(req.Env) == 0 {
 		return errors.New("nothing to update: provide bin_url and/or env")
@@ -181,24 +261,72 @@ func performUpdate(name string, req UpdateProjectRequest) error {
 	if err := ensureProjectUser(name); err != nil {
 		return err
 	}
+
+	type backup struct {
+		binData []byte
+		binMode os.FileMode
+		binExisted bool
+		envData string
+		envExisted bool
+	}
+	var bkp backup
+	hadBackup := false
+
+	// 准备 backup（如果两边都改也无所谓；只对即将被改的字段备份）
+	if req.BinURL != "" {
+		if data, err := os.ReadFile(projectBinPath(name)); err == nil {
+			info, _ := os.Stat(projectBinPath(name))
+			bkp.binData = data
+			if info != nil {
+				bkp.binMode = info.Mode().Perm()
+			}
+			bkp.binExisted = true
+		}
+	}
+	if req.Env != nil {
+		if data, err := os.ReadFile(projectEnvPath(name)); err == nil {
+			bkp.envData = string(data)
+			bkp.envExisted = true
+		}
+	}
+	hadBackup = bkp.binExisted || bkp.envExisted
+
+	rollback := func() {
+		if !hadBackup {
+			return
+		}
+		// 回写顺序：先 env 再 bin（与原 performUpdate 顺序一致）
+		if req.Env != nil && bkp.envExisted {
+			_ = os.WriteFile(projectEnvPath(name), []byte(bkp.envData), 0o640)
+		}
+		if req.BinURL != "" && bkp.binExisted {
+			_ = os.WriteFile(projectBinPath(name), bkp.binData, bkp.binMode)
+		}
+	}
+
 	if req.BinURL != "" {
 		if err := downloadBinary(req.BinURL, projectBinPath(name)); err != nil {
+			rollback()
 			return err
 		}
 		if err := os.Chmod(projectBinPath(name), 0o755); err != nil {
+			rollback()
 			return fmt.Errorf("chmod bin: %w", err)
 		}
 	}
 	if req.Env != nil {
 		if err := writeEnvFile(projectEnvPath(name), req.Env); err != nil {
+			rollback()
 			return err
 		}
 	}
 	if err := chownProjectDir(projectDir(name), name, name); err != nil {
+		rollback()
 		return err
 	}
 	_ = stopService(name)
 	if err := startService(name); err != nil {
+		// 启动失败不回滚（bin/env/chown 已成功，调用方想回滚要重新 PUT）
 		log.Printf("restart %s: %v", name, err)
 	}
 	return nil
@@ -219,8 +347,18 @@ func lookupName(w http.ResponseWriter, name string) bool {
 
 // ---------- handlers ----------
 
+// readProjectEnv 解析 K=V 文件，支持：
+//   KEY=value
+//   KEY='value with spaces'
+//   KEY='it''s'      # 标准 shell escape：'\'' 表示字面 '
 func readProjectEnv(name string) (map[string]string, error) {
-	data, err := os.ReadFile(projectEnvPath(name))
+	return readEnvFile(projectEnvPath(name))
+}
+
+// readEnvFile 从任意路径解析 K=V 文件（同 readProjectEnv 的解析规则）。
+// 抽出独立函数便于测试。
+func readEnvFile(path string) (map[string]string, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return map[string]string{}, nil
@@ -237,7 +375,13 @@ func readProjectEnv(name string) (map[string]string, error) {
 		if idx <= 0 {
 			continue
 		}
-		env[line[:idx]] = line[idx+1:]
+		k := line[:idx]
+		v := strings.TrimSpace(line[idx+1:])
+		// 反向：去外层单引号并把 '\'' 还原成 '
+		if len(v) >= 2 && v[0] == '\'' && v[len(v)-1] == '\'' {
+			v = strings.ReplaceAll(v[1:len(v)-1], `'\''`, "'")
+		}
+		env[k] = v
 	}
 	return env, nil
 }
@@ -253,6 +397,8 @@ func projectInfo(name string) Project {
 }
 
 // listProjects GET /api/v1/project
+// 只列本服务管理的项目：/etc/init.d/<name> 存在 且 /opt/<name> 目录存在。
+// 这样 crond / sshd 等系统服务不会被错误地列出来。
 func listProjects(w http.ResponseWriter, r *http.Request) {
 	entries, err := os.ReadDir("/etc/init.d")
 	if err != nil {
@@ -261,12 +407,12 @@ func listProjects(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]Project, 0, len(entries))
 	for _, e := range entries {
-		if e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+		name := e.Name()
+		if e.IsDir() || strings.HasPrefix(name, ".") || name == "alpine-rc-rest" {
 			continue
 		}
-		name := e.Name()
-		// 过滤掉 alpine-rc-rest 自身
-		if name == "alpine-rc-rest" {
+		// 只列 /opt/<name> 存在的项目
+		if _, err := os.Stat(projectDir(name)); err != nil {
 			continue
 		}
 		out = append(out, projectInfo(name))
@@ -341,6 +487,8 @@ func updateProject(w http.ResponseWriter, r *http.Request) {
 }
 
 // deleteProject DELETE /api/v1/project/{name}
+// 停用并删除。任一步骤失败返回 500 并在日志中记录已成功的步骤。
+// 响应：204 No Content（全部成功） / 500（部分失败）。
 func deleteProject(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if !isValidServiceName(name) {
@@ -351,15 +499,26 @@ func deleteProject(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusNotFound, "project not found")
 		return
 	}
-	_ = stopService(name)
+	// 收集错误，任一失败立即返 500（部分状态已改，log 出来）
+	if err := stopService(name); err != nil {
+		log.Printf("delete %s: stop: %v", name, err)
+		respondError(w, http.StatusInternalServerError, "stop failed: "+err.Error())
+		return
+	}
 	if err := removeFromAllRunlevels(name); err != nil {
-		log.Printf("rc-update del %s: %v", name, err)
+		log.Printf("delete %s: rc-update del: %v", name, err)
+		respondError(w, http.StatusInternalServerError, "rc-update del failed: "+err.Error())
+		return
 	}
 	if err := deleteServiceScript(name); err != nil {
-		log.Printf("delete init script %s: %v", name, err)
+		log.Printf("delete %s: rm init script: %v", name, err)
+		respondError(w, http.StatusInternalServerError, "remove init script failed: "+err.Error())
+		return
 	}
 	if err := removeDir(filepath.Join("/opt", name)); err != nil {
-		log.Printf("remove /opt/%s: %v", name, err)
+		log.Printf("delete %s: rm /opt/%s: %v", name, name, err)
+		respondError(w, http.StatusInternalServerError, "remove /opt/"+name+" failed: "+err.Error())
+		return
 	}
 	log.Printf("project deleted: %s", name)
 	w.WriteHeader(http.StatusNoContent)
