@@ -25,28 +25,29 @@
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/hochenggang/alpine-rc-rest/main/install.sh | sudo sh
-
-# 指定版本
-VERSION=v1.0.0 curl -fsSL https://raw.githubusercontent.com/hochenggang/alpine-rc-rest/main/install.sh | sudo sh
-
-# 本地开发
-sudo sh install.sh ./dist/alpine-rc-rest-linux-amd64
 ```
 
-安装器自动：探测平台 → 下载二进制 → 写入 `/etc/init.d/alpine-rc-rest` 与 `/etc/conf.d/alpine-rc-rest` → 打印下一步。
+安装器会**依次**：
+1. 询问 `Install alpine-rc-rest? [Y/n]`（回车 = 安装）
+2. 尝试从 GitHub Releases 拉取最新 tag
+3. 询问 `拉取 alpine-rc-rest 二进制可执行文件的 URL？`（回车 = GitHub 链接；可粘贴自定义 URL）
+4. 下载 → 装到 `/usr/local/bin/alpine-rc-rest`
+5. 随机生成 **128-bit token** 写入 `/etc/conf.d/alpine-rc-rest`（**仅在末尾打印一次**，请保存）
+6. 写入 `/etc/init.d/alpine-rc-rest` OpenRC 脚本
+
+环境变量（可选）：
+- `VERSION=v0.1.0` —— 跳过 GitHub API，手动指定版本
+- `LISTEN_ADDR=0.0.0.0:8080` —— 监听地址（默认 `:8080`）
+- `YES=1` —— 全程非交互（适合 CI；URL/TOKEN 也可走环境变量）
 
 ## 快速开始
 
 ```sh
-# 1. 设置 Token（强烈推荐）
-sudo sed -i 's|^SERVICE_MANAGER_TOKEN=.*|SERVICE_MANAGER_TOKEN="$(openssl rand -hex 24)"|' /etc/conf.d/alpine-rc-rest
-
-# 2. 启动
+# 1. 启动
 sudo rc-service alpine-rc-rest start
 sudo rc-update add alpine-rc-rest default
 
-# 3. 创建一个项目
-TOKEN=$(sudo grep SERVICE_MANAGER_TOKEN /etc/conf.d/alpine-rc-rest | cut -d'"' -f2)
+# 2. 创建一个项目（TOKEN 就是 install.sh 末尾打印的 32 位十六进制串）
 curl -X POST http://127.0.0.1:8080/api/v1/project \
   -H "X-API-Token: $TOKEN" \
   -H "Content-Type: application/json" \
@@ -377,7 +378,7 @@ curl -fsS -X POST "$HOST/api/v1/project" \
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `SERVICE_MANAGER_TOKEN` | （空） | 启用鉴权。未设置时所有请求放行（dev 模式） |
-| `LISTEN_ADDR` | `:8080` | 监听地址（编译时硬编码于 `main.go`） |
+| `LISTEN_ADDR` | `:8080` | 监听地址（运行时读环境变量） |
 
 ## 安全
 
@@ -404,8 +405,8 @@ sudo ./alpine-rc-rest
 
 ```sh
 go vet ./...
-# 交叉编译
-GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o alpine-rc-rest-linux-arm64 .
+# 编译（Alpine x86_64）
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o alpine-rc-rest .
 ```
 
 ### 目录结构
@@ -419,7 +420,6 @@ alpine-rc-rest/
 ├── utils.go       # Response 统一格式 + name 正则
 ├── install.sh
 ├── design.md
-├── api.md
 └── .github/workflows/release.yml
 ```
 
@@ -427,7 +427,6 @@ alpine-rc-rest/
 
 - [README.md](file:///c:/Users/Administrator/Documents/codes/alpine-rc-rest/README.md)：本文件
 - [design.md](file:///c:/Users/Administrator/Documents/codes/alpine-rc-rest/design.md)：架构与设计
-- [api.md](file:///c:/Users/Administrator/Documents/codes/alpine-rc-rest/api.md)：完整 API 文档
 
 ## 路线图
 

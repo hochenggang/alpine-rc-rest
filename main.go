@@ -26,8 +26,12 @@ func main() {
 
 	handler := corsMiddleware(authMiddleware(mux))
 
+	addr := os.Getenv("LISTEN_ADDR")
+	if addr == "" {
+		addr = ":8080"
+	}
 	srv := &http.Server{
-		Addr:              ":8080",
+		Addr:              addr,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -36,7 +40,7 @@ func main() {
 	defer stop()
 
 	go func() {
-		log.Printf("alpine-rc-rest listening on :8080")
+		log.Printf("alpine-rc-rest listening on %s", addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("server error: %v", err)
 		}

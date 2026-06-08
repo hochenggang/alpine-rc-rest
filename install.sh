@@ -1,16 +1,19 @@
 #!/usr/bin/env sh
 # install.sh — 一键安装 alpine-rc-rest（Alpine Linux 上管理 OpenRC 服务的 REST API）
+#
 # 行为：
-#   1. 探测 OS/ARCH（仅支持 Linux）
-#   2. 从 GitHub Releases 下载对应二进制（或使用本地 ./dist/）
-#   3. 安装到 /usr/local/bin/alpine-rc-rest
-#   4. 写入 /etc/init.d/alpine-rc-rest OpenRC 服务
-#   5. 打印下一步操作建议
+#   1. 询问是否安装 [Y/n]（默认 Y）
+#   2. 尝试从 GitHub Releases 获取最新版本与对应 amd64 资产 URL
+#   3. 询问用户是否提供自定义 URL（回车使用默认 GitHub 链接）
+#   4. 下载 → 装到 /usr/local/bin/alpine-rc-rest
+#   5. 随机生成 128-bit token 写入 /etc/conf.d/alpine-rc-rest
+#   6. 写入 /etc/init.d/alpine-rc-rest
+#   7. 打印 token + 下一步操作
 #
 # 用法：
 #   curl -fsSL https://raw.githubusercontent.com/<owner>/alpine-rc-rest/main/install.sh | sudo sh
 #   VERSION=v0.1.0 sudo sh install.sh
-#   sudo sh install.sh /path/to/local-binary   # 本地安装（开发用）
+#   非交互：YES=1 URL=https://... TOKEN=<hex32> sudo sh install.sh
 
 set -eu
 
@@ -19,15 +22,73 @@ VERSION="${VERSION:-}"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 SERVICE_NAME="${SERVICE_NAME:-alpine-rc-rest}"
 LISTEN_ADDR="${LISTEN_ADDR:-:8080}"
-TOKEN="${SERVICE_MANAGER_TOKEN:-}"
-PORT="${LISTEN_ADDR##*:}"
+NONINTERACTIVE="${YES:-0}"
 
-# 本地二进制模式
-LOCAL_BIN="${1:-}"
+# ---------- UI ----------
 
 log()  { printf '\033[1;34m[install]\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
-err()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33m[warn]\033[0m    %s\n' "$*" >&2; }
+err()  { printf '\033[1;31m[error]\033[0m  %s\n' "$*" >&2; }
+
+# confirm <prompt> [default_yes=1]  询问 Y/n；回车 = 默认
+confirm() {
+  prompt="$1"
+  default_yes="${2:-1}"
+  if [ "$default_yes" = "1" ]; then
+    suffix="[Y/n]"; def="Y"
+  else
+    suffix="[y/N]"; def="N"
+  fi
+  printf "%s %s " "$prompt" "$suffix"
+  if [ "$NONINTERACTIVE" = "1" ]; then
+    printf "%s (non-interactive)\n" "$def"
+    [ "$def" = "Y" ]
+    return $?
+  fi
+  read -r ans || true
+  if [ -z "$ans" ]; then ans=$def; fi
+  case "$ans" in
+    Y|y|yes|YES|Yes) return 0 ;;
+    N|n|no|NO|No)    return 1 ;;
+    *)               return 1 ;;
+  esac
+}
+
+# ask_url <prompt> <default>  询问 URL；回车 = 默认
+ask_url() {
+  prompt="$1"
+  default="$2"
+  printf "%s\n" "$prompt"
+  printf "  default: %s\n" "$default"
+  printf "  custom : "
+  if [ "$NONINTERACTIVE" = "1" ]; then
+    printf "%s (non-interactive)\n" "$default"
+    printf "%s" "$default"
+    return
+  fi
+  read -r ans || true
+  if [ -z "$ans" ]; then
+    printf "%s" "$default"
+  else
+    printf "%s" "$ans"
+  fi
+}
+
+# gen_token_128bit 输出 32 个十六进制字符（= 128 bit）
+gen_token_128bit() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 16
+    return
+  fi
+  if [ -r /dev/urandom ]; then
+    head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'
+    return
+  fi
+  # 兜底：从 uuid 去连字符
+  cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d - | head -c 32
+}
+
+# ---------- 检查 ----------
 
 need_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -39,59 +100,65 @@ need_root() {
 detect_arch() {
   os=$(uname -s | tr '[:upper:]' '[:lower:]')
   arch=$(uname -m)
-  case "$arch" in
-    x86_64)  goarch=amd64 ;;
-    aarch64) goarch=arm64 ;;
-    armv7l)  goarch=arm ;;
-    i386|i686) goarch=386 ;;
-    *)
-      err "不支持的架构：$arch"
-      exit 1
-      ;;
-  esac
   case "$os" in
-    linux) goos=linux ;;
+    linux) ;;
+    *) err "此脚本仅支持 Linux（alpine-rc-rest 设计目标为 Alpine Linux）"; exit 1 ;;
+  esac
+  case "$arch" in
+    x86_64) goarch=amd64 ;;
     *)
-      err "此脚本仅支持 Linux（alpine-rc-rest 设计目标为 Alpine Linux）"
+      err "本仓库 release 仅提供 linux/amd64（你的架构：$arch）。"
+      err "如需其他架构请自行 cross-compile 或在 PR 中扩展 matrix。"
       exit 1
       ;;
   esac
-  echo "$goos/$goarch"
+  goos=linux
+  log "目标平台：$goos/$goarch"
 }
 
-resolve_version() {
-  if [ -n "$VERSION" ]; then
-    echo "$VERSION"
-    return
-  fi
-  log "未指定 VERSION，查询最新 release ..."
+# resolve_latest_release 尝试从 GitHub 拿最新 release 的 tag_name
+# 成功：echo "<tag>"; 失败：echo "" 并 warn
+resolve_latest_release() {
   url="https://api.github.com/repos/${REPO}/releases/latest"
+  body=""
   if command -v curl >/dev/null 2>&1; then
-    tag=$(curl -fsSL "$url" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)
+    body=$(curl -fsSL "$url" 2>/dev/null || true)
   elif command -v wget >/dev/null 2>&1; then
-    tag=$(wget -qO- "$url" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)
+    body=$(wget -qO- "$url" 2>/dev/null || true)
   fi
-  if [ -z "${tag:-}" ]; then
-    warn "无法获取最新版本，使用 v0.0.0（请手动指定 VERSION）"
-    echo "v0.0.0"
-  else
-    echo "$tag"
+  if [ -z "$body" ]; then
+    warn "无法访问 GitHub API（无网络 / 限流）"
+    return 1
   fi
+  tag=$(printf '%s' "$body" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)
+  if [ -z "$tag" ]; then
+    warn "GitHub API 响应未包含 tag_name"
+    return 1
+  fi
+  printf '%s' "$tag"
+}
+
+# validate_url 仅允许 http/https
+validate_url() {
+  case "$1" in
+    http://*|https://*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 download() {
-  ver="$1"
-  asset="alpine-rc-rest-${os}-${goarch}"
-  base="https://github.com/${REPO}/releases/download/${ver}"
+  url="$1"
   tmpdir=$(mktemp -d)
   trap 'rm -rf "$tmpdir"' EXIT
-  log "下载 $base/$asset"
+  asset="alpine-rc-rest-${goos}-${goarch}"
+  out="$tmpdir/$asset"
+  log "下载 $url"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL -o "$tmpdir/$asset" "$base/$asset"
+    curl -fsSL -o "$out" "$url"
   else
-    wget -qO "$tmpdir/$asset" "$base/$asset"
+    wget -qO "$out" "$url"
   fi
-  echo "$tmpdir/$asset"
+  printf '%s' "$out"
 }
 
 install_binary() {
@@ -101,17 +168,23 @@ install_binary() {
   log "已安装到 $dst"
 }
 
-write_openrc_script() {
+# write_conf_d 写入 /etc/conf.d/<name>：LISTEN_ADDR 与 SERVICE_MANAGER_TOKEN
+write_conf_d() {
+  token="$1"
   cfg="/etc/conf.d/${SERVICE_NAME}"
   cat > "$cfg" <<EOF
 # ${SERVICE_NAME} 配置文件
 # 监听地址（默认 :8080）
 LISTEN_ADDR="${LISTEN_ADDR}"
-# API Token，留空表示禁用鉴权（dev 模式）
-SERVICE_MANAGER_TOKEN="${TOKEN}"
+# API Token；install.sh 自动生成
+SERVICE_MANAGER_TOKEN="${token}"
 EOF
   chmod 0640 "$cfg"
+  log "已写入 $cfg"
+}
 
+# write_openrc_script 写入 /etc/init.d/<name>
+write_openrc_script() {
   initd="/etc/init.d/${SERVICE_NAME}"
   cat > "$initd" <<'EOF'
 #!/sbin/openrc-run
@@ -133,52 +206,109 @@ start_pre() {
         . /etc/conf.d/alpine-rc-rest
     fi
     export SERVICE_MANAGER_TOKEN
+    export LISTEN_ADDR
 }
 EOF
   chmod 0755 "$initd"
-  log "已写入 $initd（配置：$cfg）"
+  log "已写入 $initd"
 }
 
 post_install_tips() {
+  token="$1"
+  port="${LISTEN_ADDR##*:}"
   cat <<EOF
 
 [✓] 安装完成。
 
+================================================================
+  API Token（请妥善保存，仅打印这一次）：
+    ${token}
+================================================================
+
 下一步：
-  1. （推荐）设置 API Token：
-       sudo sed -i 's|^SERVICE_MANAGER_TOKEN=.*|SERVICE_MANAGER_TOKEN="<your-token>"|' /etc/conf.d/alpine-rc-rest
-  2. 修改监听地址（默认 :8080）：
-       sudo sed -i 's|^LISTEN_ADDR=.*|LISTEN_ADDR="0.0.0.0:8080"|' /etc/conf.d/alpine-rc-rest
-  3. 启动并设置开机自启：
+  1. 启动并设置开机自启：
        sudo rc-service ${SERVICE_NAME} start
        sudo rc-update add ${SERVICE_NAME} default
-  4. 验证：
-       curl -s -H "X-API-Token: <your-token>" http://127.0.0.1:${PORT}/api/v1/services
+  2. 验证：
+       curl -s -H "X-API-Token: ${token}" \\
+            http://127.0.0.1:${port}/api/v1/project
+  3. 部署一个项目（示例）：
+       curl -X POST http://127.0.0.1:${port}/api/v1/project \\
+            -H "X-API-Token: ${token}" \\
+            -H "Content-Type: application/json" \\
+            -d '{
+              "project_name": "myapi",
+              "bin_url":      "https://example.com/myapi-linux-amd64",
+              "env": { "PORT": "8080" }
+            }'
 
 详细文档：https://github.com/${REPO}
 EOF
 }
 
+# ---------- 主流程 ----------
+
 main() {
   need_root
   detect_arch
-  log "目标平台：$goos/$goarch"
 
-  if [ -n "$LOCAL_BIN" ]; then
-    if [ ! -f "$LOCAL_BIN" ]; then
-      err "本地二进制不存在：$LOCAL_BIN"
-      exit 1
-    fi
-    install_binary "$LOCAL_BIN"
-  else
-    ver=$(resolve_version)
-    log "使用版本：$ver"
-    bin=$(download "$ver")
-    install_binary "$bin"
+  cat <<'BANNER'
+────────────────────────────────────────────
+   alpine-rc-rest 安装器
+   极简 · 零依赖 · OpenRC 进程管理 REST API
+────────────────────────────────────────────
+BANNER
+
+  # 1. 安装确认
+  if ! confirm "Install alpine-rc-rest?" 1; then
+    log "已取消"
+    exit 0
   fi
 
+  # 2. 确定版本
+  if [ -z "$VERSION" ]; then
+    log "查询最新 release ..."
+    if VERSION=$(resolve_latest_release); then
+      [ -n "$VERSION" ] && log "检测到最新版本：$VERSION"
+    fi
+    if [ -z "$VERSION" ]; then
+      warn "无法自动获取版本；请设置 VERSION 环境变量（如 VERSION=v0.1.0）后重试。"
+      exit 1
+    fi
+  fi
+  log "使用版本：$VERSION"
+
+  # 3. 计算默认 URL + URL 提示
+  default_url="https://github.com/${REPO}/releases/download/${VERSION}/alpine-rc-rest-${goos}-${goarch}"
+  url=$(ask_url "拉取 alpine-rc-rest 二进制可执行文件的 URL？回车使用默认 GitHub 链接，或粘贴自定义 URL：" "$default_url")
+  if [ -z "$url" ]; then url="$default_url"; fi
+  if ! validate_url "$url"; then
+    err "非法 URL（仅支持 http/https）：$url"
+    exit 1
+  fi
+  log "目标 URL：$url"
+
+  # 4. 下载 + 装包
+  bin=$(download "$url")
+  install_binary "$bin"
+
+  # 5. token
+  if [ -n "${TOKEN:-}" ]; then
+    log "使用环境变量提供的 TOKEN"
+  else
+    TOKEN=$(gen_token_128bit)
+  fi
+  if [ "${#TOKEN}" -ne 32 ]; then
+    err "TOKEN 长度异常（期望 32 个 hex 字符，实际 ${#TOKEN}）"
+    exit 1
+  fi
+
+  # 6. 写配置 + OpenRC
+  write_conf_d "$TOKEN"
   write_openrc_script
-  post_install_tips
+
+  # 7. 打印 token
+  post_install_tips "$TOKEN"
 }
 
 main "$@"

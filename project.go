@@ -142,12 +142,17 @@ start_pre() {
 // performCreate 完整创建流程：准备目录 → 用户 → 下载二进制 → 写 env → 写 init → 授权 → 启动
 func performCreate(req CreateProjectRequest) error {
 	name := req.ProjectName
-	mkdirProject(name)
+	if err := os.MkdirAll(projectDir(name), 0o750); err != nil {
+		return fmt.Errorf("mkdir %s: %w", projectDir(name), err)
+	}
 	if err := ensureProjectUser(name); err != nil {
 		return err
 	}
 	if err := downloadBinary(req.BinURL, projectBinPath(name)); err != nil {
 		return err
+	}
+	if err := os.Chmod(projectBinPath(name), 0o755); err != nil {
+		return fmt.Errorf("chmod bin: %w", err)
 	}
 	if err := writeEnvFile(projectEnvPath(name), req.Env); err != nil {
 		return err
@@ -156,9 +161,6 @@ func performCreate(req CreateProjectRequest) error {
 		return err
 	}
 	if err := chownProjectDir(projectDir(name), name, name); err != nil {
-		return err
-	}
-	if err := chmodBin(projectBinPath(name)); err != nil {
 		return err
 	}
 	_ = stopService(name)
@@ -183,8 +185,8 @@ func performUpdate(name string, req UpdateProjectRequest) error {
 		if err := downloadBinary(req.BinURL, projectBinPath(name)); err != nil {
 			return err
 		}
-		if err := chmodBin(projectBinPath(name)); err != nil {
-			return err
+		if err := os.Chmod(projectBinPath(name), 0o755); err != nil {
+			return fmt.Errorf("chmod bin: %w", err)
 		}
 	}
 	if req.Env != nil {
@@ -202,13 +204,17 @@ func performUpdate(name string, req UpdateProjectRequest) error {
 	return nil
 }
 
-func mkdirProject(name string) error {
-	return os.MkdirAll(projectDir(name), 0o750)
-}
-
-// chmodBin 把二进制文件设为 0755
-func chmodBin(path string) error {
-	return os.Chmod(path, 0o755)
+// lookupName 校验 name 合法且项目存在；不通过则写错误并返回 false
+func lookupName(w http.ResponseWriter, name string) bool {
+	if !isValidServiceName(name) {
+		respondError(w, http.StatusBadRequest, "invalid project name")
+		return false
+	}
+	if !serviceExists(name) {
+		respondError(w, http.StatusNotFound, "project not found")
+		return false
+	}
+	return true
 }
 
 // ---------- handlers ----------
@@ -271,12 +277,7 @@ func listProjects(w http.ResponseWriter, r *http.Request) {
 // getProject GET /api/v1/project/{name}
 func getProject(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	if !isValidServiceName(name) {
-		respondError(w, http.StatusBadRequest, "invalid project name")
-		return
-	}
-	if !serviceExists(name) {
-		respondError(w, http.StatusNotFound, "project not found")
+	if !lookupName(w, name) {
 		return
 	}
 	respondOK(w, projectInfo(name))
@@ -367,8 +368,7 @@ func deleteProject(w http.ResponseWriter, r *http.Request) {
 // startProject POST /api/v1/project/{name}/start
 func startProject(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	if !isValidServiceName(name) || !serviceExists(name) {
-		respondError(w, http.StatusNotFound, "project not found")
+	if !lookupName(w, name) {
 		return
 	}
 	if err := startService(name); err != nil {
@@ -381,8 +381,7 @@ func startProject(w http.ResponseWriter, r *http.Request) {
 // stopProject POST /api/v1/project/{name}/stop
 func stopProject(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	if !isValidServiceName(name) || !serviceExists(name) {
-		respondError(w, http.StatusNotFound, "project not found")
+	if !lookupName(w, name) {
 		return
 	}
 	if err := stopService(name); err != nil {
@@ -395,8 +394,7 @@ func stopProject(w http.ResponseWriter, r *http.Request) {
 // restartProject POST /api/v1/project/{name}/restart
 func restartProject(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	if !isValidServiceName(name) || !serviceExists(name) {
-		respondError(w, http.StatusNotFound, "project not found")
+	if !lookupName(w, name) {
 		return
 	}
 	if err := restartService(name); err != nil {
